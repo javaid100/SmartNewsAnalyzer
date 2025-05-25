@@ -1,143 +1,238 @@
-import subprocess
-import sys
-
-subprocess.run([sys.executable, "-m", "pip", "install", "--user", "streamlit", "gdown", "tensorflow", "keras", "torch", "transformers", "spacy"])
-
-
-# ------------------------------
-# Load Pretrained Models & Tokenizers
-# ------------------------------
-
+# -------------------- Imports and Configuration --------------------
 import os
-import json
-import gdown
-import torch
-import numpy as np
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import streamlit as st
+import logging
+import asyncio
+import atexit
+import warnings
+
+import gdown
+import numpy as np
 import tensorflow as tf
+import torch
+
+import transformers
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.preprocessing.text import tokenizer_from_json
 from transformers import AutoTokenizer, TFAutoModel, PegasusTokenizer, PegasusForConditionalGeneration
 
-# Google Drive file IDs for required resources
+# -------------------- Streamlit Setup --------------------
+st.set_page_config(page_title="📰 Smart News Analyzer", layout="wide")
+transformers.logging.set_verbosity_error()
+warnings.filterwarnings("ignore")
+logging.basicConfig(filename="app_debug.log", level=logging.ERROR)
+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+def clean_shutdown():
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.stop()
+    except Exception:
+        pass
+atexit.register(clean_shutdown)
+
+# -------------------- Constants --------------------
 GOOGLE_DRIVE_FILES = {
-    "bilstm_model.h5":     "1Js-MS8K8kWT23STTrYo9WizRpdr2qcYL",
-    "cnn_model.h5":        "1mUgDlby6p4c6UF7wph85nSd0Gj_NLy0B",
-    "bert_model.h5":       "1l2wbEES9-VaOGSVNEmK3bUqH3o2VVaXr",
-    "tokenizer.json":      "1Cgn06cl2D-TG4wAintOL_Ng3gCir28Rv",
+    "bilstm_model.h5": "1Js-MS8K8kWT23STTrYo9WizRpdr2qcYL",
+    "cnn_model.h5": "1mUgDlby6p4c6UF7wph85nSd0Gj_NLy0B",
+    "bert_model.h5": "1l2wbEES9-VaOGSVNEmK3bUqH3o2VVaXr",
+    "tokenizer.json": "1Cgn06cl2D-TG4wAintOL_Ng3gCir28Rv",
+}
+class_names = ['World', 'Sports', 'Business', 'Sci/Tech']
+max_len = 128
+
+# -------------------- File Download --------------------
+@st.cache_resource(show_spinner=True)
+def download_model_files():
+    for filename, file_id in GOOGLE_DRIVE_FILES.items():
+        if not os.path.exists(filename):
+            gdown.download(f"https://drive.google.com/uc?id={file_id}", filename, quiet=False)
+
+download_model_files()
+
+# -------------------- Custom LSTM Fix --------------------
+from tensorflow.keras.layers import LSTM as KerasLSTM
+from tensorflow.keras.utils import deserialize_keras_object
+from tensorflow.keras.saving import register_keras_serializable
+
+@register_keras_serializable()
+class CustomLSTM(KerasLSTM):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('time_major', None)
+        super().__init__(*args, **kwargs)
+
+tf.keras.layers.LSTM = CustomLSTM
+
+# -------------------- Model Caches --------------------
+models = {
+    'pegasus_tokenizer': None,
+    'pegasus_model': None,
+    'bert_tokenizer': None,
+    'bert_model': None,
+    'bilstm_model': None,
+    'cnn_model': None,
+    'tokenizer': None,
 }
 
-def download_from_drive(filename, file_id):
-    if not os.path.exists(filename):
-        url = f"https://drive.google.com/uc?id={file_id}"
-        gdown.download(url, filename, quiet=False)
-    else:
-        print(f"{filename} already exists, skipping.")
+# -------------------- Loaders --------------------
+def load_pegasus():
+    """Load PEGASUS tokenizer and model once."""
+    if models['pegasus_model'] is None or models['pegasus_tokenizer'] is None:
+        models['pegasus_tokenizer'] = PegasusTokenizer.from_pretrained("google/pegasus-xsum")
+        models['pegasus_model'] = PegasusForConditionalGeneration.from_pretrained("google/pegasus-xsum")
 
-@st.cache_resource
-def load_all_models():
-    # Download files if missing
-    for filename, file_id in GOOGLE_DRIVE_FILES.items():
-        download_from_drive(filename, file_id)
+def load_bert():
+    """Load BERT tokenizer and model with pretrained weights, cache in models dict."""
+    if models['bert_model'] is not None and models['bert_tokenizer'] is not None:
+        return  # Already loaded
 
-    # Load PEGASUS (for headline generation)
-    pegasus_tokenizer = PegasusTokenizer.from_pretrained("google/pegasus-xsum")
-    pegasus_model = PegasusForConditionalGeneration.from_pretrained("google/pegasus-xsum")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        base = TFAutoModel.from_pretrained("bert-base-uncased")
+        base.trainable = False  # Freeze BERT base layers
 
-    # Load BERT tokenizer and model
-    bert_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    bert_base = TFAutoModel.from_pretrained("bert-base-uncased")
+        input_ids = tf.keras.Input(shape=(max_len,), dtype=tf.int32, name='input_ids')
+        attention_mask = tf.keras.Input(shape=(max_len,), dtype=tf.int32, name='attention_mask')
 
-    input_ids = tf.keras.Input(shape=(128,), dtype=tf.int32, name='input_ids')
-    attention_mask = tf.keras.Input(shape=(128,), dtype=tf.int32, name='attention_mask')
-    outputs = bert_base(input_ids, attention_mask=attention_mask)
-    cls_output = outputs.last_hidden_state[:, 0, :]
-    x = tf.keras.layers.Dropout(0.3)(cls_output)
-    x = tf.keras.layers.Dense(64, activation='relu')(x)
-    x = tf.keras.layers.Dropout(0.3)(x)
-    output = tf.keras.layers.Dense(4, activation='softmax')(x)
-    bert_model = tf.keras.Model(inputs=[input_ids, attention_mask], outputs=output)
-    bert_model.load_weights("bert_model.h5")
+        outputs = base(input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0, :]
 
-    # Load BiLSTM and CNN models
-    bilstm_model = load_model("bilstm_model.h5")
-    cnn_model = load_model("cnn_model.h5")
+        x = tf.keras.layers.Dropout(0.3)(cls_output)
+        x = tf.keras.layers.Dense(64, activation='relu')(x)
+        x = tf.keras.layers.Dropout(0.3)(x)
+        out = tf.keras.layers.Dense(len(class_names), activation='softmax')(x)
 
-    # Load tokenizer
-    with open("tokenizer.json") as f:
-        tokenizer = tokenizer_from_json(json.load(f))
+        model = tf.keras.Model(inputs=[input_ids, attention_mask], outputs=out)
+        model.load_weights("bert_model.h5")
 
-    return pegasus_tokenizer, pegasus_model, bert_tokenizer, bert_model, bilstm_model, cnn_model, tokenizer
+        models['bert_tokenizer'] = tokenizer
+        models['bert_model'] = model
+    except Exception as e:
+        logging.exception("Error loading BERT model")
+        models['bert_model'] = None
+        models['bert_tokenizer'] = None
 
+def load_bilstm_cnn_tokenizer():
+    """Load BiLSTM, CNN models and tokenizer once."""
+    if models['bilstm_model'] is None:
+        try:
+            models['bilstm_model'] = load_model("bilstm_model.h5", custom_objects={"LSTM": CustomLSTM})
+        except Exception as e:
+            logging.exception("Error loading BiLSTM model")
+            models['bilstm_model'] = None
+    if models['cnn_model'] is None:
+        try:
+            models['cnn_model'] = load_model("cnn_model.h5")
+        except Exception as e:
+            logging.exception("Error loading CNN model")
+            models['cnn_model'] = None
+    if models['tokenizer'] is None:
+        try:
+            with open("tokenizer.json", "r") as f:
+                models['tokenizer'] = tokenizer_from_json(f.read())
+        except Exception as e:
+            logging.exception("Error loading tokenizer JSON")
+            models['tokenizer'] = None
 
-pegasus_tokenizer, pegasus_model, bert_tokenizer, bert_model, bilstm_model, cnn_model, tokenizer = load_all_models()
-max_len = 128  # or use your actual padded length
+# -------------------- Prediction Logic --------------------
+def classify_article(article, selected_models):
+    """Classify article text using selected models and return best prediction."""
+    try:
+        results = {}
 
-# ------------------------------
-# Utilities
-# ------------------------------
+        if any(m in selected_models for m in ["BiLSTM", "CNN"]):
+            load_bilstm_cnn_tokenizer()
+            if models['tokenizer'] is None:
+                logging.error("Tokenizer not loaded, cannot process BiLSTM/CNN")
+            else:
+                seq = models['tokenizer'].texts_to_sequences([article])
+                padded = pad_sequences(seq, maxlen=max_len, padding='post', truncating='post')
 
-def classify_article(article):
-    # Preprocess
-    seq = tokenizer.texts_to_sequences([article])
-    padded_seq = pad_sequences(seq, maxlen=max_len, padding='post', truncating='post')
+        if "BiLSTM" in selected_models and models['bilstm_model'] is not None:
+            probs = models['bilstm_model'].predict(padded, verbose=0)
+            results['BiLSTM'] = (np.argmax(probs), np.max(probs))
 
-    # BiLSTM and CNN
-    bilstm_probs = bilstm_model.predict(padded_seq)
-    cnn_probs = cnn_model.predict(padded_seq)
+        if "CNN" in selected_models and models['cnn_model'] is not None:
+            probs = models['cnn_model'].predict(padded, verbose=0)
+            results['CNN'] = (np.argmax(probs), np.max(probs))
 
-    # BERT
-    encod = bert_tokenizer(article, truncation=True, padding='max_length', max_length=128, return_tensors='tf')
-    bert_probs = bert_model.predict({'input_ids': encod['input_ids'], 'attention_mask': encod['attention_mask']})
+        if "BERT" in selected_models:
+            load_bert()
+            if models['bert_model'] is not None and models['bert_tokenizer'] is not None:
+                tokenizer = models['bert_tokenizer']
+                inputs = tokenizer(article, truncation=True, padding='max_length', max_length=max_len, return_tensors='tf')
+                probs = models['bert_model'].predict(inputs, verbose=0)
+                results['BERT'] = (np.argmax(probs), np.max(probs))
+            else:
+                logging.error("BERT model or tokenizer not loaded")
 
-    confidences = [np.max(bilstm_probs), np.max(cnn_probs), np.max(bert_probs)]
-    preds = [np.argmax(bilstm_probs), np.argmax(cnn_probs), tf.argmax(bert_probs, axis=1).numpy()[0]]
-    model_names = ['BiLSTM', 'CNN', 'BERT']
-    class_names = ['World', 'Sports', 'Business', 'Sci/Tech']
+        if not results:
+            return None
 
-    best_idx = np.argmax(confidences)
+        best_model = max(results, key=lambda k: results[k][1])
+        best_idx, best_conf = results[best_model]
+        return {
+            'best_model': best_model,
+            'predicted_class': class_names[best_idx],
+            'confidence': best_conf,
+            'all_results': {m: (class_names[i], c) for m, (i, c) in results.items()}
+        }
 
-    return {
-        'best_model': model_names[best_idx],
-        'predicted_class': class_names[preds[best_idx]],
-        'confidence': confidences[best_idx],
-        'all_results': dict(zip(model_names, zip([class_names[i] for i in preds], confidences)))
-    }
+    except Exception as e:
+        logging.exception("Classification error")
+        return None
 
 def generate_headline(article):
-    inputs = pegasus_tokenizer(article, truncation=True, padding='max_length', max_length=512, return_tensors="pt")
-    with torch.no_grad():
-        summary_ids = pegasus_model.generate(inputs["input_ids"], num_beams=4, max_length=60, early_stopping=True)
-    return pegasus_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+    """Generate a headline using PEGASUS summarization."""
+    try:
+        load_pegasus()
+        tokenizer = models['pegasus_tokenizer']
+        model = models['pegasus_model']
+        inputs = tokenizer(article, return_tensors="pt", truncation=True, padding='max_length', max_length=256)
+        with torch.no_grad():
+            summary_ids = model.generate(inputs["input_ids"], num_beams=4, max_length=60, early_stopping=True)
+        return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+    except Exception as e:
+        logging.exception("Headline generation error")
+        return "[Headline Generation Failed]"
 
-# ------------------------------
-# Streamlit UI
-# ------------------------------
-
-st.set_page_config(page_title="📰 Smart News Analyzer", layout="wide")
+# -------------------- Streamlit UI --------------------
 st.title("📰 Smart News Analyzer")
-st.markdown("Classify a news article and generate a headline using BiLSTM, CNN, BERT and PEGASUS!")
+st.markdown("Classify a news article and generate a headline using **BiLSTM, CNN, BERT**, and **PEGASUS**!")
 
-article_input = st.text_area("Enter a news article (short paragraph)", height=200)
+model_options = ["BiLSTM", "CNN", "BERT", "PEGASUS (Headline)"]
+selected_models = st.multiselect("Select models to use:", model_options, default=model_options)
 
-if st.button("Analyze"):
+article_input = st.text_area("📝 Enter a news article:", height=200)
+
+if st.button("🚀 Analyze"):
     if not article_input.strip():
         st.warning("Please enter a news article.")
     else:
         with st.spinner("Analyzing..."):
-            classification = classify_article(article_input)
-            headline = generate_headline(article_input)
+            classification = classify_article(article_input, selected_models)
 
-        # Show classification
-        st.subheader("📌 Classification Results")
-        st.success(f"**Category:** `{classification['predicted_class']}`")
-        st.info(f"**Best Model:** `{classification['best_model']}` with confidence `{classification['confidence']:.2f}`")
+            if classification:
+                st.subheader("📊 Classification Results")
+                st.write(f"**Best Model:** {classification['best_model']}")
+                st.write(f"**Predicted Class:** {classification['predicted_class']}")
+                st.write(f"**Confidence:** {classification['confidence']:.2f}")
+                st.write("### All Model Results:")
+                for m, (cls, conf) in classification['all_results'].items():
+                    st.write(f"- {m}: {cls} ({conf:.2f})")
+            else:
+                st.error("Classification failed or no model selected.")
 
-        with st.expander("🔍 View all model predictions"):
-            for model, (pred, conf) in classification['all_results'].items():
-                st.write(f"**{model}** → {pred} ({conf:.2f})")
-
-        # Show headline
-        st.subheader("📰 Generated Headline")
-        st.write(f"**{headline}**")
+            if "PEGASUS (Headline)" in selected_models:
+                headline = generate_headline(article_input)
+                st.subheader("📰 Generated Headline")
+                st.markdown(f"> {headline}")
