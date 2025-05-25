@@ -1,8 +1,20 @@
 import subprocess
 import sys
 
-# Install all dependencies from requirements.txt
-subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+# List of required packages
+packages = [
+    "streamlit",
+    "gdown",
+    "tensorflow",
+    "keras",
+    "torch",
+    "transformers",
+    "spacy"
+]
+
+# Install missing packages
+for package in packages:
+    subprocess.run([sys.executable, "-m", "pip", "install", package])
 
 
 # ------------------------------
