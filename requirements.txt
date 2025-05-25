@@ -1,7 +1,8 @@
-streamlit
-gdown
-tensorflow==2.19.0
+streamlit==1.5.1
+gdown==5.2.0
+tensorflow==2.5.3
 keras
-torch
-transformers
-spacy
+torch==1.10.2
+transformers==4.15.0
+sentence-transformers==1.2.1
+spacy==2.3.9
