@@ -1,3 +1,10 @@
+import subprocess
+import sys
+
+# Install all dependencies from requirements.txt
+subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+
+
 # ------------------------------
 # Load Pretrained Models & Tokenizers
 # ------------------------------
