@@ -1,0 +1,7 @@
+streamlit
+gdown
+tensorflow
+keras
+torch
+transformers
+spacy
