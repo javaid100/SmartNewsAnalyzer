@@ -1,6 +1,6 @@
 streamlit
 gdown
-tensorflow
+tensorflow==2.19.0
 keras
 torch
 transformers
