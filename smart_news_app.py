@@ -1,24 +1,48 @@
-import streamlit as st
-import numpy as np
-import tensorflow as tf
-import torch
-from transformers import AutoTokenizer, TFAutoModel, PegasusTokenizer, PegasusForConditionalGeneration
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import load_model
-
 # ------------------------------
 # Load Pretrained Models & Tokenizers
 # ------------------------------
 
+import os
+import json
+import gdown
+import torch
+import numpy as np
+import streamlit as st
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.preprocessing.text import tokenizer_from_json
+from transformers import AutoTokenizer, TFAutoModel, PegasusTokenizer, PegasusForConditionalGeneration
+
+# Google Drive file IDs for required resources
+GOOGLE_DRIVE_FILES = {
+    "bilstm_model.h5":     "1Js-MS8K8kWT23STTrYo9WizRpdr2qcYL",
+    "cnn_model.h5":        "1mUgDlby6p4c6UF7wph85nSd0Gj_NLy0B",
+    "bert_model.h5":       "1l2wbEES9-VaOGSVNEmK3bUqH3o2VVaXr",
+    "tokenizer.json":      "1Cgn06cl2D-TG4wAintOL_Ng3gCir28Rv",
+}
+
+def download_from_drive(filename, file_id):
+    if not os.path.exists(filename):
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, filename, quiet=False)
+    else:
+        print(f"{filename} already exists, skipping.")
+
 @st.cache_resource
 def load_all_models():
-    # Load PEGASUS
+    # Download files if missing
+    for filename, file_id in GOOGLE_DRIVE_FILES.items():
+        download_from_drive(filename, file_id)
+
+    # Load PEGASUS (for headline generation)
     pegasus_tokenizer = PegasusTokenizer.from_pretrained("google/pegasus-xsum")
     pegasus_model = PegasusForConditionalGeneration.from_pretrained("google/pegasus-xsum")
 
-    # Load BERT
+    # Load BERT tokenizer and model
     bert_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     bert_base = TFAutoModel.from_pretrained("bert-base-uncased")
+
     input_ids = tf.keras.Input(shape=(128,), dtype=tf.int32, name='input_ids')
     attention_mask = tf.keras.Input(shape=(128,), dtype=tf.int32, name='attention_mask')
     outputs = bert_base(input_ids, attention_mask=attention_mask)
@@ -30,14 +54,16 @@ def load_all_models():
     bert_model = tf.keras.Model(inputs=[input_ids, attention_mask], outputs=output)
     bert_model.load_weights("bert_model.h5")
 
-    # Load BiLSTM and CNN
+    # Load BiLSTM and CNN models
     bilstm_model = load_model("bilstm_model.h5")
     cnn_model = load_model("cnn_model.h5")
 
     # Load tokenizer
-    tokenizer = tf.keras.preprocessing.text.tokenizer_from_json(open("tokenizer.json").read())
+    with open("tokenizer.json") as f:
+        tokenizer = tokenizer_from_json(json.load(f))
 
     return pegasus_tokenizer, pegasus_model, bert_tokenizer, bert_model, bilstm_model, cnn_model, tokenizer
+
 
 pegasus_tokenizer, pegasus_model, bert_tokenizer, bert_model, bilstm_model, cnn_model, tokenizer = load_all_models()
 max_len = 128  # or use your actual padded length
