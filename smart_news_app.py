@@ -1,7 +1,14 @@
 import subprocess
 import sys
 
-subprocess.run([sys.executable, "-m", "pip", "install", "--user", "streamlit", "gdown", "tensorflow", "keras", "torch", "transformers", "spacy"])
+# Ensure gdown is installed
+try:
+    import gdown
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "gdown"])
+    import gdown  # Retry importing after installation
+
+# subprocess.run([sys.executable, "-m", "pip", "install", "--user", "streamlit", "gdown", "tensorflow", "keras", "torch", "transformers", "spacy"])
 
 
 # ------------------------------
